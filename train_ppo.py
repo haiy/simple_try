@@ -4,8 +4,6 @@ from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
 
-# trl 0.11.3
-
 # ✅ 设置模型路径
 MODEL_NAME = "./Qwen1.5-1.8B"
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -16,7 +14,7 @@ if tokenizer.pad_token_id is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 # ✅ 生成数学数据
-def generate_math_data(num_samples=500):
+def generate_math_data(num_samples=300):
     data = []
     for _ in range(num_samples):
         a, b = random.randint(1, 100), random.randint(1, 100)
@@ -29,7 +27,7 @@ def generate_math_data(num_samples=500):
         data.append({"question": question, "answer": str(answer)})
     return data
 
-synthetic_math_data = generate_math_data(500)
+synthetic_math_data = generate_math_data()
 math_dataset = Dataset.from_dict({
     "question": [d["question"] for d in synthetic_math_data], 
     "answer": [d["answer"] for d in synthetic_math_data]
@@ -38,7 +36,7 @@ math_dataset = Dataset.from_dict({
 # ✅ 处理数据
 def tokenize(sample):
     encoded_question = tokenizer(
-        sample["question"], padding="max_length", truncation=True, max_length=128, return_tensors="pt"
+        sample["question"], padding="max_length", truncation=True, max_length=50, return_tensors="pt"
     )
     return {
         "input_ids": encoded_question["input_ids"].squeeze(0),
@@ -52,10 +50,10 @@ ds.set_format(type="torch")
 # ✅ 配置 PPO
 config = PPOConfig(
     model_name=MODEL_NAME,
-    learning_rate=1.41e-5,
-    batch_size=1,
-    mini_batch_size=1,
-    log_with='wandb'  # 关闭 wandb 记录
+    learning_rate=1e-6,
+    batch_size=8,
+    mini_batch_size=8,
+    log_with='wandb',  # 关闭 wandb 记录
 )
 
 model = AutoModelForCausalLMWithValueHead.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(device)
@@ -71,9 +69,9 @@ from torch.cuda.amp import autocast
 
 # ✅ 训练循环
 for epoch in range(3):  # 训练 3 个 epoch
-    batch_size = 1  # 处理多个示例
+    batch_size = config.batch_size  # 处理多个示例
     
-    for batch in ds.shuffle().select(range(50)).train_test_split(test_size=0.2)["train"].batch(batch_size):  
+    for batch in ds.shuffle().train_test_split(test_size=0.2)["train"].batch(batch_size):  
         queries = batch["question"]  # 取多个 question
         correct_answers = batch["answer"]
 
@@ -96,13 +94,21 @@ for epoch in range(3):  # 训练 3 个 epoch
         responses_tensor = list(tokenizer(decoded_responses, return_tensors="pt", padding=True, truncation=True, max_length=128).input_ids.to(device))
 
         # ✅ 进行 PPO 训练（batch 训练）
-        ppo_trainer.step(queries_tensor, responses_tensor, scores)
-
+        stats = ppo_trainer.step(queries_tensor, responses_tensor, scores)
+        ppo_trainer.log_stats(stats, batch, scores,columns_to_log=['question', 'answer'])
     print(f"✅ Epoch {epoch + 1} 完成")
+
+# ✅ 创建保存路径
+SAVE_PATH = "./ppo_trained_model"
+model.save_pretrained(SAVE_PATH)
+tokenizer.save_pretrained(SAVE_PATH)
+
+print(f"✅ 训练后模型已保存至 {SAVE_PATH}")
+
 
 # ✅ 训练后评估
 test_question = "What is 7 * 6?"
-encoded_test_question = tokenizer(test_question, return_tensors="pt", padding=False, truncation=True, max_length=128).to(device)
+encoded_test_question = tokenizer(test_question, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
 result = model.generate(encoded_test_question.input_ids, max_length=50)
 print("测试问题:", test_question)
 print("模型答案:", tokenizer.decode(result[0], skip_special_tokens=True))
